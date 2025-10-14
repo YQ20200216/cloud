@@ -22,6 +22,7 @@ namespace myspace{
                 std::stringstream sstream;
                 writer->write(root,&sstream);
                 *str=sstream.str();
+                return true;
             }
             //反序列化
             static bool UnSerialize(const std::string &str, Json::Value *root)
