@@ -208,6 +208,7 @@
     
 
 // server.hpp 部分代码（之前已有，这里完整展示）
+// 启动热点管理和HTTP服务两个线程
 
 #include <thread>
 #include "httplib.h"

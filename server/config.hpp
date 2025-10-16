@@ -1,9 +1,11 @@
 // config.hpp
+//服务器ip，端口等参数需要灵活配置，对应需要一个配置文件cloud.json
 #pragma once
 #include "util.hpp"
 #include <mutex>
 namespace myspace
 {
+    //单例避免重复读取
     class Config
     {
     public:

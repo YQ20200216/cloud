@@ -48,7 +48,7 @@ namespace myspace
         DataManager()
         {
             _backup_file = Config::GetInstance().GetBackupFile();
-            InitLoad();
+            InitLoad();//启动时加载cloud.data中备份信息
         }
         // 初始化加载，每次系统重启都要加载以嵌的数据
         bool InitLoad()
@@ -165,7 +165,7 @@ namespace myspace
             return true;
         }
         private:
-            std::string _backup_file;                           // 持久化存储文件
+            std::string _backup_file;                           // 备份信息存放文件
             std::shared_mutex _rwlock;                           // 读写锁，读共享，写互斥
             std::unordered_map<std::string, BackupInfo> _table; // 内存中hash存储的文件信息管理表
     };

@@ -185,6 +185,7 @@ namespace myspace
         // 服务启动（httplib 绑定对应处理函数）
         bool RunModule()
         {
+            //注册路由
             _server.Post("/upload", Upload);    // 文件上传请求
             _server.Get("/listshow", ListShow); // 文件查看请求
             _server.Get("/", ListShow);
@@ -203,13 +204,13 @@ namespace myspace
         {
             // post /upload  文件数据在正文中（正文并不全是文件数据）
             std::cout<<"uploading ..."<<std::endl;
-            auto ret = req.has_file("file"); // 判断有没有上传的文件区域
+            auto ret = req.has_file("file"); // 判断有没有上传的文件区域，file来源后面HTML表单中name='file'
             if (ret == false)
             {
                 rsp.status = 400;
                 return;
             }
-            const auto &file = req.get_file_value("file");
+            const auto &file = req.get_file_value("file");//获取上传文件对象
             // file.filename//文件名称    file.content//文件数据
             std::string back_dir = Config::GetInstance().GetBackDir();
             std::string realpath = back_dir + FileUtil(file.filename).FileName();
@@ -289,7 +290,7 @@ namespace myspace
 
             bool retrans = false; // 是否需要断点续传标志
             std::string old_etag;
-            if (req.has_header("If-Range"))
+            if (req.has_header("If-Range"))//来源HTTP/1.1协议
             {
                 old_etag = req.get_header_value("If-Range");
                 // 有If-Range字段且，这个字段的值与请求文件的最新etag一致则符合断点续传
@@ -303,11 +304,18 @@ namespace myspace
             FileUtil fu(info._real_path);
             if (retrans == false)
             {
+                /*HTTP/1.1 200 OK
+                Accept-Ranges: bytes                           ← HTTP 标准字段
+                ETag: "bigfile.zip-5000001-1729087200"        ← HTTP 标准字段
+                Content-Type: application/octet-stream         ← HTTP 标准字段
+                Content-Length: 5000001
+
+                [完整文件数据...]*/
                 fu.GetContent(&rsp.body);
                 // 5. 设置响应头部字段： ETag， Accept-Ranges: bytes
-                rsp.set_header("Accept-Ranges", "bytes");
-                rsp.set_header("ETag", GetETag(info));
-                rsp.set_header("Content-Type", "application/octet-stream");
+                rsp.set_header("Accept-Ranges", "bytes");//支持按字节范围请求
+                rsp.set_header("ETag", GetETag(info));// 示例值："bigfile.zip-5000001-1729087200"
+                rsp.set_header("Content-Type", "application/octet-stream");//指定响应内容为二进制文件
                 rsp.status = 200;
             }
             else
@@ -316,11 +324,18 @@ namespace myspace
                 // 只需要我们用户将文件所有数据读取到rsp.body中，它内部会自动根据请求
                 // 区间，从body中取出指定区间数据进行响应
                 //  std::string  range = req.get_header_val("Range"); bytes=start-end
+                /*HTTP/1.1 206 Partial Content
+                Accept-Ranges: bytes                           ← HTTP 标准字段
+                ETag: "bigfile.zip-5000001-1729087200"        ← HTTP 标准字段
+                Content-Type: application/octet-stream         ← HTTP 标准字段
+                Content-Range: bytes 1000000-5000000/5000001   ← HTTP 标准字段（httplib 自动添加）
+
+                [部分文件数据...]
+                */
                 fu.GetContent(&rsp.body);
                 rsp.set_header("Accept-Ranges", "bytes");
                 rsp.set_header("ETag", GetETag(info));
                 rsp.set_header("Content-Type", "application/octet-stream");
-                // rsp.set_header("Content-Range", "bytes start-end/fsize");
                 rsp.status = 206; // 区间请求响应的是206
             }
         }
