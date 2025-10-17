@@ -457,6 +457,1007 @@ HotManager::RunModule() (循环运行)
     → 继续下一轮
 ```
 
+## 完整场景流程详解
+
+服务器端共有 **6 个核心场景**，以下是每个场景从开始到结束的完整代码执行流程。
+
+### 场景 1：服务器启动场景
+
+**入口**：`cloud.cpp` 的 `main()` 函数（234-241行）
+
+**完整执行流程**：
+
+```
+main() 函数启动
+  │
+  ├─→ [步骤 1] 创建全局 DataManager 对象
+  │      data = new myspace::DataManager();
+  │      
+  │      触发 DataManager 构造函数 (data.hpp: 50-68行)：
+  │        ├─→ 初始化数据库连接信息
+  │        │     db_host = "127.0.0.1"
+  │        │     db_user = "root"
+  │        │     db_password = "123456"
+  │        │     db_name = "cloud_backup"
+  │        │
+  │        ├─→ 创建 MySQLManager 对象
+  │        │     _mysql = new MySQLManager();
+  │        │
+  │        ├─→ 连接 MySQL 数据库
+  │        │     _mysql->Connect(db_host, db_user, db_password, db_name)
+  │        │     
+  │        │     Connect 流程 (mysql_manager.hpp: 19-39行)：
+  │        │       ├─→ 获取 MySQL 驱动实例
+  │        │       │     driver = sql::mysql::get_mysql_driver_instance();
+  │        │       │
+  │        │       ├─→ 构建连接 URL
+  │        │       │     url = "tcp://127.0.0.1:3306"
+  │        │       │
+  │        │       ├─→ 建立数据库连接
+  │        │       │     _conn.reset(driver->connect(url, user, password));
+  │        │       │
+  │        │       └─→ 选择数据库
+  │        │             _conn->setSchema("cloud_backup");
+  │        │
+  │        └─→ 加载历史数据到内存
+  │              InitLoad() (data.hpp: 76-113行)：
+  │                ├─→ 加写锁（独占访问）
+  │                │     std::unique_lock<std::shared_mutex> lock(_rwlock);
+  │                │
+  │                ├─→ 获取数据库连接
+  │                │     auto& conn = _mysql->GetConn();
+  │                │
+  │                ├─→ 创建 SQL 语句执行器
+  │                │     std::unique_ptr<sql::Statement> stmt(conn->createStatement());
+  │                │
+  │                ├─→ 执行查询语句
+  │                │     std::unique_ptr<sql::ResultSet> res(
+  │                │         stmt->executeQuery("SELECT * FROM backup_info")
+  │                │     );
+  │                │
+  │                ├─→ 遍历结果集
+  │                │     while (res->next()) {
+  │                │         BackupInfo info;
+  │                │         info._id = res->getInt("id");
+  │                │         info._url_path = res->getString("url_path");
+  │                │         info._real_path = res->getString("real_path");
+  │                │         info._pack_path = res->getString("pack_path");
+  │                │         info._pack_flag = res->getBoolean("pack_flag");
+  │                │         info._fsize = res->getUInt64("fsize");
+  │                │         info._mtime = res->getInt64("mtime");
+  │                │         info._atime = res->getInt64("atime");
+  │                │         
+  │                │         // 存入内存哈希表
+  │                │         _table[info._url_path] = info;
+  │                │         count++;
+  │                │     }
+  │                │
+  │                ├─→ 输出加载信息
+  │                │     std::cout << "加载了 " << count << " 条备份记录" << std::endl;
+  │                │
+  │                └─→ 释放锁，返回成功
+  │
+  ├─→ [步骤 2] 创建热点管理线程
+  │      std::thread thread_hot_manager(HotTest);
+  │      
+  │      HotTest() 函数 (cloud.cpp: 223-227行)：
+  │        └─→ 创建 HotManager 对象
+  │              myspace::HotManager hot;
+  │              
+  │              HotManager 构造函数 (hot.hpp: 13-25行)：
+  │                ├─→ 从 Config 读取配置
+  │                │     _back_dir = "./backdir/"
+  │                │     _pack_dir = "./packdir/"
+  │                │     _pack_suffix = ".lz"
+  │                │     _hot_time = 30
+  │                │
+  │                └─→ 创建必要目录
+  │                      FileUtil tmp1(_back_dir);
+  │                      FileUtil tmp2(_pack_dir);
+  │                      tmp1.CreateDirectory();
+  │                      tmp2.CreateDirectory();
+  │              
+  │              hot.RunModule();  // 进入热点管理循环（详见场景6）
+  │
+  ├─→ [步骤 3] 创建 HTTP 服务线程
+  │      std::thread thread_service(ServiceTest);
+  │      
+  │      ServiceTest() 函数 (cloud.cpp: 229-233行)：
+  │        └─→ 创建 Service 对象
+  │              myspace::Service srv;
+  │              
+  │              Service 构造函数 (server.hpp: 178-184行)：
+  │                └─→ 从 Config 读取配置
+  │                      _server_port = 9000
+  │                      _server_ip = "0.0.0.0"
+  │                      _download_prefix = "/download/"
+  │              
+  │              srv.RunModule() (server.hpp: 186-199行)：
+  │                ├─→ 注册路由映射
+  │                │     _server.Post("/upload", Upload);
+  │                │     _server.Get("/listshow", ListShow);
+  │                │     _server.Get("/", ListShow);
+  │                │     _server.Get("/download/(.*)", Download);
+  │                │
+  │                └─→ 启动 HTTP 服务监听
+  │                      _server.listen("0.0.0.0", 9000);
+  │                      // 服务器开始等待客户端连接
+  │
+  └─→ [步骤 4] 主线程等待
+        thread_hot_manager.join();  // 等待热点管理线程
+        thread_service.join();      // 等待 HTTP 服务线程
+        // 程序持续运行，直到手动终止
+```
+
+**启动完成后的状态**：
+- MySQL 数据库连接已建立
+- 历史数据已加载到内存（unordered_map）
+- 热点管理线程正在后台运行（每1ms扫描一次）
+- HTTP 服务在 9000 端口监听请求
+
+---
+
+### 场景 2：文件上传场景
+
+**触发条件**：HTTP POST 请求到 `/upload`
+
+**请求示例**：
+```http
+POST /upload HTTP/1.1
+Content-Type: multipart/form-data; boundary=----WebKitFormBoundary
+Content-Length: 1234
+
+------WebKitFormBoundary
+Content-Disposition: form-data; name="file"; filename="test.txt"
+Content-Type: text/plain
+
+[文件内容...]
+------WebKitFormBoundary--
+```
+
+**完整执行流程**：
+
+```
+HTTP POST /upload 请求到达
+  │
+  └─→ httplib 路由匹配，调用 Service::Upload() (server.hpp: 203-222行)
+        │
+        ├─→ [步骤 1] 检查是否有上传文件
+        │      std::cout << "uploading ..." << std::endl;
+        │      auto ret = req.has_file("file");
+        │      
+        │      if (ret == false) {
+        │          rsp.status = 400;  // Bad Request
+        │          return;  // 终止处理
+        │      }
+        │      
+        │      说明：has_file("file") 检查 multipart/form-data 中
+        │           是否有 name="file" 的表单字段
+        │
+        ├─→ [步骤 2] 获取上传的文件对象
+        │      const auto &file = req.get_file_value("file");
+        │      
+        │      file 对象包含：
+        │        - file.filename: "test.txt"（文件名）
+        │        - file.content:  "Hello World..."（文件内容）
+        │
+        ├─→ [步骤 3] 构造文件存储路径
+        │      std::string back_dir = Config::GetInstance().GetBackDir();
+        │      // back_dir = "./backdir/"
+        │      
+        │      std::string realpath = back_dir + FileUtil(file.filename).FileName();
+        │      // realpath = "./backdir/test.txt"
+        │      
+        │      说明：FileUtil(file.filename).FileName() 提取纯文件名
+        │           （去除可能的路径部分）
+        │
+        ├─→ [步骤 4] 将文件内容写入磁盘
+        │      FileUtil fu(realpath);
+        │      fu.SetContent(file.content);
+        │      
+        │      SetContent 流程 (util.hpp)：
+        │        ├─→ 打开文件输出流
+        │        │     std::ofstream ofs(realpath, std::ios::binary);
+        │        │
+        │        ├─→ 写入内容
+        │        │     ofs.write(file.content.c_str(), file.content.size());
+        │        │
+        │        └─→ 关闭文件
+        │              ofs.close();
+        │      
+        │      结果：./backdir/test.txt 文件创建成功
+        │
+        ├─→ [步骤 5] 创建备份信息
+        │      BackupInfo info;
+        │      info.NewBackupInfo(realpath);
+        │      
+        │      NewBackupInfo 流程 (data.hpp: 26-43行)：
+        │        ├─→ 检查文件是否存在
+        │        │     FileUtil file(realpath);
+        │        │     if (!file.Exists()) return false;
+        │        │
+        │        ├─→ 获取配置信息
+        │        │     Config config = Config::GetInstance();
+        │        │
+        │        ├─→ 填充文件基本信息
+        │        │     _real_path = realpath;  // "./backdir/test.txt"
+        │        │     _fsize = file.FileSize();  // 1024 字节
+        │        │     _mtime = file.LastModifyTime();  // 1729087200
+        │        │     _atime = file.LastAcccessTime();  // 1729087200
+        │        │
+        │        ├─→ 设置压缩相关信息
+        │        │     _pack_flag = false;  // 初始未压缩
+        │        │     _pack_path = "./packdir/test.txt.lz"
+        │        │
+        │        └─→ 构造下载 URL
+        │              _url_path = "/download/test.txt"
+        │
+        └─→ [步骤 6] 插入到数据管理模块
+              data->Insert(info);
+              
+              Insert 流程 (data.hpp: 116-158行)：
+                ├─→ 加写锁（独占访问）
+                │     std::unique_lock<std::shared_mutex> lock(_rwlock);
+                │
+                ├─→ 获取数据库连接
+                │     auto& conn = _mysql->GetConn();
+                │     if (!conn) return false;
+                │
+                ├─→ 构造 SQL 插入语句
+                │     std::stringstream sql;
+                │     sql << "INSERT INTO backup_info "
+                │         << "(url_path, real_path, pack_path, pack_flag, fsize, mtime, atime) "
+                │         << "VALUES ('"
+                │         << "/download/test.txt" << "', '"
+                │         << "./backdir/test.txt" << "', '"
+                │         << "./packdir/test.txt.lz" << "', "
+                │         << "0, 1024, 1729087200, 1729087200) "
+                │         << "ON DUPLICATE KEY UPDATE "
+                │         << "real_path='./backdir/test.txt', "
+                │         << "pack_path='./packdir/test.txt.lz', "
+                │         << "pack_flag=0, fsize=1024, mtime=1729087200, atime=1729087200";
+                │     
+                │     说明：ON DUPLICATE KEY UPDATE 实现"插入或更新"语义
+                │          如果 url_path 已存在，则更新；否则插入新记录
+                │
+                ├─→ 执行 SQL 语句
+                │     std::unique_ptr<sql::Statement> stmt(conn->createStatement());
+                │     stmt->executeUpdate(sql.str());
+                │     
+                │     数据库变化：backup_info 表新增一条记录
+                │
+                ├─→ 更新内存缓存
+                │     _table[info._url_path] = info;
+                │     // _table["/download/test.txt"] = info;
+                │
+                ├─→ 输出成功信息
+                │     std::cout << "插入成功: " << info._url_path << std::endl;
+                │
+                └─→ 释放锁，返回成功
+                      return true;
+```
+
+**执行结果**：
+- 文件系统：`./backdir/test.txt` 文件创建
+- MySQL 数据库：`backup_info` 表插入一条记录
+- 内存缓存：`_table` 哈希表新增一个键值对
+- HTTP 响应：200 OK（httplib 自动设置）
+
+---
+
+### 场景 3：文件列表展示场景
+
+**触发条件**：HTTP GET 请求到 `/listshow` 或 `/`
+
+**完整执行流程**：
+
+```
+HTTP GET /listshow 请求到达
+  │
+  └─→ httplib 路由匹配，调用 Service::ListShow() (server.hpp: 231-260行)
+        │
+        ├─→ [步骤 1] 获取所有备份文件信息
+        │      std::vector<BackupInfo> arry;
+        │      data->GetAll(&arry);
+        │      
+        │      GetAll 流程 (data.hpp: 226-233行)：
+        │        ├─→ 加读锁（共享访问）
+        │        │     std::shared_lock<std::shared_mutex> lock(_rwlock);
+        │        │
+        │        ├─→ 遍历内存哈希表
+        │        │     for (const auto& pair : _table) {
+        │        │         arry->push_back(pair.second);
+        │        │     }
+        │        │     
+        │        │     例如：arry 中包含
+        │        │       - BackupInfo { _url_path="/download/test.txt", ... }
+        │        │       - BackupInfo { _url_path="/download/image.jpg", ... }
+        │        │       - BackupInfo { _url_path="/download/doc.pdf", ... }
+        │        │
+        │        └─→ 释放锁，返回成功
+        │
+        ├─→ [步骤 2] 开始构造 HTML 页面
+        │      std::stringstream ss;
+        │      
+        │      ├─→ 添加文件上传表单
+        │      │     ss << "<html><body>";
+        │      │     ss << "<form action='/upload' method='post' "
+        │      │        << "enctype='multipart/form-data'>";
+        │      │     ss << " <input type='file' name='file'>";
+        │      │     ss << "<input type='submit' value='upload'>";
+        │      │     ss << " </form></body></html>";
+        │      │     
+        │      │     生成的表单：
+        │      │       [选择文件] [upload按钮]
+        │      │
+        │      └─→ 添加下载列表页头
+        │            ss << "<html><head><title>Download</title></head>";
+        │            ss << "<body><h1>Download</h1><table>";
+        │
+        ├─→ [步骤 3] 遍历所有备份信息，生成表格行
+        │      for (auto &a : arry) {
+        │          // 开始一行
+        │          ss << "<tr>";
+        │          
+        │          // 提取文件名
+        │          std::string filename = FileUtil(a._real_path).FileName();
+        │          // filename = "test.txt"
+        │          
+        │          // 生成下载链接（第一列）
+        │          ss << "<td><a href='" << a._url_path << "'>" 
+        │             << filename << "</a></td>";
+        │          // 生成：<td><a href='/download/test.txt'>test.txt</a></td>
+        │          
+        │          // 显示修改时间（第二列）
+        │          ss << "<td align='right'>" << TimetoStr(a._mtime) << "</td>";
+        │          
+        │          TimetoStr 流程 (server.hpp: 224-228行)：
+        │            std::string tmp = std::ctime(&t);
+        │            // tmp = "Wed Oct 17 12:00:00 2024\n"
+        │            return tmp;
+        │          
+        │          // 显示文件大小（第三列，转换为KB）
+        │          ss << "<td align='right'>" << a._fsize / 1024 << "k</td>";
+        │          
+        │          // 结束一行
+        │          ss << "</tr>";
+        │      }
+        │      
+        │      生成的表格行示例：
+        │        <tr>
+        │          <td><a href='/download/test.txt'>test.txt</a></td>
+        │          <td align='right'>Wed Oct 17 12:00:00 2024</td>
+        │          <td align='right'>1k</td>
+        │        </tr>
+        │
+        ├─→ [步骤 4] 结束 HTML 页面
+        │      ss << "</table></body></html>";
+        │
+        └─→ [步骤 5] 设置响应
+              rsp.body = ss.str();  // 设置响应正文为生成的HTML
+              rsp.set_header("Content-Type", "text/html");  // 内容类型
+              rsp.status = 200;  // HTTP 状态码
+              return;
+```
+
+**HTTP 响应示例**：
+```http
+HTTP/1.1 200 OK
+Content-Type: text/html
+Content-Length: 512
+
+<html><body>
+<form action='/upload' method='post' enctype='multipart/form-data'>
+  <input type='file' name='file'>
+  <input type='submit' value='upload'>
+</form>
+<h1>Download</h1>
+<table>
+  <tr>
+    <td><a href='/download/test.txt'>test.txt</a></td>
+    <td align='right'>Wed Oct 17 12:00:00 2024</td>
+    <td align='right'>1k</td>
+  </tr>
+  <tr>
+    <td><a href='/download/image.jpg'>image.jpg</a></td>
+    <td align='right'>Wed Oct 17 13:30:00 2024</td>
+    <td align='right'>500k</td>
+  </tr>
+</table>
+</body></html>
+```
+
+**浏览器显示效果**：
+```
+┌────────────────────────────────────────┐
+│  [选择文件] [upload]                    │
+├────────────────────────────────────────┤
+│  Download                               │
+├────────────────────────────────────────┤
+│  test.txt         Wed Oct 17 12:00  1k │
+│  image.jpg        Wed Oct 17 13:30  500k│
+└────────────────────────────────────────┘
+```
+
+---
+
+### 场景 4：文件下载场景（正常下载）
+
+**触发条件**：HTTP GET 请求到 `/download/test.txt`
+
+**完整执行流程**：
+
+```
+HTTP GET /download/test.txt 请求到达
+  │
+  └─→ httplib 路由匹配，调用 Service::Download() (server.hpp: 274-341行)
+        │
+        ├─→ [步骤 1] 获取请求的资源路径
+        │      std::string url = req.path;
+        │      // url = "/download/test.txt"
+        │
+        ├─→ [步骤 2] 根据 URL 查询备份信息
+        │      BackupInfo info;
+        │      data->GetOneByURL(req.path, info);
+        │      
+        │      GetOneByURL 流程 (data.hpp: 201-210行)：
+        │        ├─→ 加读锁（共享访问）
+        │        │     std::shared_lock<std::shared_mutex> lock(_rwlock);
+        │        │
+        │        ├─→ 在哈希表中查找
+        │        │     auto it = _table.find("/download/test.txt");
+        │        │     if (it == _table.end()) {
+        │        │         return false;  // 文件不存在
+        │        │     }
+        │        │
+        │        ├─→ 返回备份信息
+        │        │     info = it->second;
+        │        │     // info 现在包含：
+        │        │     //   _real_path = "./backdir/test.txt"
+        │        │     //   _pack_flag = false (未压缩)
+        │        │     //   _fsize = 1024
+        │        │     //   ...
+        │        │
+        │        └─→ 释放锁，返回成功
+        │
+        ├─→ [步骤 3] 检查文件是否被压缩
+        │      if (info._pack_flag == true) {
+        │          // 文件已被压缩，需要先解压
+        │          
+        │          FileUtil fu(info._pack_path);
+        │          // fu 指向压缩包：./packdir/test.txt.lz
+        │          
+        │          fu.UnCompress(info._real_path);
+        │          // 解压到：./backdir/test.txt
+        │          
+        │          UnCompress 流程 (util.hpp)：
+        │            ├─→ 打开压缩包文件
+        │            ├─→ 使用 zlib 解压数据
+        │            ├─→ 将解压数据写入目标文件
+        │            └─→ 关闭文件
+        │          
+        │          fu.Remove();
+        │          // 删除压缩包：./packdir/test.txt.lz
+        │          
+        │          info._pack_flag = false;
+        │          data->Update(info);
+        │          // 更新数据库和内存缓存中的压缩标志
+        │      }
+        │      
+        │      此场景假设：_pack_flag = false（未压缩），跳过此步
+        │
+        ├─→ [步骤 4] 判断是否断点续传
+        │      bool retrans = false;
+        │      std::string old_etag;
+        │      
+        │      if (req.has_header("If-Range")) {
+        │          old_etag = req.get_header_value("If-Range");
+        │          if (old_etag == GetETag(info)) {
+        │              retrans = true;
+        │          }
+        │      }
+        │      
+        │      GetETag 流程 (server.hpp: 262-272行)：
+        │        FileUtil fu(info._real_path);
+        │        std::string etag = fu.FileName();  // "test.txt"
+        │        etag += "-";
+        │        etag += std::to_string(info._fsize);  // "1024"
+        │        etag += "-";
+        │        etag += std::to_string(info._mtime);  // "1729087200"
+        │        return etag;  // "test.txt-1024-1729087200"
+        │      
+        │      此场景假设：没有 If-Range 头，retrans = false（正常下载）
+        │
+        ├─→ [步骤 5] 读取文件内容
+        │      FileUtil fu(info._real_path);
+        │      
+        │      if (retrans == false) {
+        │          // 正常下载分支
+        │          
+        │          fu.GetContent(&rsp.body);
+        │          
+        │          GetContent 流程 (util.hpp)：
+        │            ├─→ 打开文件
+        │            │     std::ifstream ifs(path, std::ios::binary);
+        │            │
+        │            ├─→ 获取文件大小
+        │            │     ifs.seekg(0, std::ios::end);
+        │            │     size_t fsize = ifs.tellg();
+        │            │     ifs.seekg(0, std::ios::beg);
+        │            │
+        │            ├─→ 读取全部内容
+        │            │     content->resize(fsize);
+        │            │     ifs.read(&(*content)[0], fsize);
+        │            │
+        │            └─→ 关闭文件
+        │                  ifs.close();
+        │          
+        │          结果：rsp.body 现在包含文件的全部内容
+        │      }
+        │
+        └─→ [步骤 6] 设置响应头和状态码
+              if (retrans == false) {
+                  // 正常下载响应
+                  
+                  rsp.set_header("Accept-Ranges", "bytes");
+                  // 告诉客户端支持按字节范围请求
+                  
+                  rsp.set_header("ETag", GetETag(info));
+                  // ETag: "test.txt-1024-1729087200"
+                  // 用于断点续传验证
+                  
+                  rsp.set_header("Content-Type", "application/octet-stream");
+                  // 指定响应内容为二进制文件流
+                  
+                  rsp.status = 200;
+                  // HTTP 200 OK
+              }
+```
+
+**HTTP 响应示例**：
+```http
+HTTP/1.1 200 OK
+Accept-Ranges: bytes
+ETag: "test.txt-1024-1729087200"
+Content-Type: application/octet-stream
+Content-Length: 1024
+
+[文件的全部二进制内容...]
+```
+
+**执行结果**：
+- 客户端收到完整文件内容
+- 如果文件被压缩，自动解压后返回
+- 响应头包含 ETag，支持后续断点续传
+
+---
+
+### 场景 5：文件断点续传下载场景
+
+**触发条件**：HTTP GET 请求 + `If-Range` 和 `Range` 请求头
+
+**请求示例**：
+```http
+GET /download/bigfile.zip HTTP/1.1
+If-Range: "bigfile.zip-50000001-1729087200"
+Range: bytes=1000000-5000000
+```
+
+**完整执行流程**：
+
+```
+HTTP GET /download/bigfile.zip 请求到达（带断点续传头）
+  │
+  └─→ httplib 路由匹配，调用 Service::Download() (server.hpp: 274-341行)
+        │
+        ├─→ [步骤 1-3] 同场景 4
+        │      获取 URL → 查询备份信息 → 检查是否压缩
+        │
+        ├─→ [步骤 4] 判断是否断点续传 ⭐ 关键步骤
+        │      bool retrans = false;
+        │      std::string old_etag;
+        │      
+        │      // 检查是否有 If-Range 请求头
+        │      if (req.has_header("If-Range")) {
+        │          // 有 If-Range 头，表示客户端请求断点续传
+        │          
+        │          old_etag = req.get_header_value("If-Range");
+        │          // old_etag = "bigfile.zip-50000001-1729087200"
+        │          
+        │          // 计算当前文件的 ETag
+        │          std::string new_etag = GetETag(info);
+        │          // new_etag = "bigfile.zip-50000001-1729087200"
+        │          
+        │          // 比对 ETag
+        │          if (old_etag == new_etag) {
+        │              // ETag 相同 → 文件未被修改 → 允许断点续传
+        │              retrans = true;  ✅
+        │          } else {
+        │              // ETag 不同 → 文件已被修改 → 拒绝断点续传
+        │              retrans = false;  ❌
+        │              // 将按正常下载处理（返回全部数据）
+        │          }
+        │      }
+        │      
+        │      断点续传条件：
+        │        ✅ 必须有 If-Range 请求头
+        │        ✅ If-Range 的值必须与当前文件的 ETag 相同
+        │      
+        │      此场景：retrans = true
+        │
+        ├─→ [步骤 5] 读取文件内容
+        │      FileUtil fu(info._real_path);
+        │      
+        │      if (retrans == true) {
+        │          // 断点续传分支
+        │          
+        │          fu.GetContent(&rsp.body);
+        │          
+        │          注意：虽然读取了全部内容到 rsp.body，
+        │               但 httplib 库会根据 Range 请求头
+        │               自动截取 body 中的指定区间返回
+        │          
+        │          Range 头解析（httplib 内部自动处理）：
+        │            Range: bytes=1000000-5000000
+        │            ↓
+        │            从 rsp.body 中提取字节 [1000000, 5000000]
+        │            ↓
+        │            实际返回 4000001 字节
+        │      }
+        │
+        └─→ [步骤 6] 设置断点续传响应头
+              if (retrans == true) {
+                  // 断点续传响应
+                  
+                  rsp.set_header("Accept-Ranges", "bytes");
+                  // 支持按字节范围请求
+                  
+                  rsp.set_header("ETag", GetETag(info));
+                  // ETag: "bigfile.zip-50000001-1729087200"
+                  
+                  rsp.set_header("Content-Type", "application/octet-stream");
+                  // 二进制文件流
+                  
+                  rsp.status = 206;  ⭐ 206 Partial Content
+                  // 状态码 206 表示"部分内容"，用于断点续传
+                  
+                  // httplib 自动添加 Content-Range 头：
+                  // Content-Range: bytes 1000000-5000000/50000001
+                  //                     （起始-结束/总大小）
+              }
+```
+
+**HTTP 响应示例**：
+```http
+HTTP/1.1 206 Partial Content
+Accept-Ranges: bytes
+ETag: "bigfile.zip-50000001-1729087200"
+Content-Type: application/octet-stream
+Content-Range: bytes 1000000-5000000/50000001
+Content-Length: 4000001
+
+[部分文件数据：从字节 1000000 到 5000000]
+```
+
+**断点续传工作原理**：
+
+1. **首次下载**（下载到一半中断）：
+   ```
+   客户端发送：GET /download/bigfile.zip
+   服务器返回：200 OK + ETag: "bigfile.zip-50000001-1729087200"
+   客户端下载到 1000000 字节时网络中断
+   客户端记录：已下载 1000000 字节，ETag="bigfile.zip-50000001-1729087200"
+   ```
+
+2. **续传请求**：
+   ```
+   客户端发送：GET /download/bigfile.zip
+              If-Range: "bigfile.zip-50000001-1729087200"
+              Range: bytes=1000000-
+   服务器验证：ETag 相同 → 文件未修改 → 允许续传
+   服务器返回：206 Partial Content + 剩余数据
+   ```
+
+3. **ETag 不匹配情况**：
+   ```
+   如果文件在下载期间被修改：
+     - 文件大小或修改时间改变
+     - ETag 值随之改变
+     - 服务器检测到 ETag 不匹配
+     - 返回 200 OK + 全部数据（重新下载）
+   ```
+
+---
+
+### 场景 6：热点文件管理场景（后台压缩）
+
+**触发条件**：热点管理线程持续运行（每1ms扫描一次）
+
+**完整执行流程**：
+
+```
+HotManager::RunModule() 进入无限循环 (hot.hpp: 27-59行)
+  │
+  └─→ while (1) {  // 无限循环，持续监控
+        │
+        ├─→ [步骤 1] 扫描备份目录
+        │      FileUtil file(_back_dir);
+        │      // file 指向 "./backdir/"
+        │      
+        │      std::vector<std::string> arr;
+        │      file.GetDirectory(arr);
+        │      
+        │      GetDirectory 流程 (util.hpp)：
+        │        ├─→ 使用 C++17 filesystem 库遍历目录
+        │        │     namespace fs = std::filesystem;
+        │        │     for (auto& entry : fs::directory_iterator(path)) {
+        │        │         if (entry.is_regular_file()) {
+        │        │             arr->push_back(entry.path().string());
+        │        │         }
+        │        │     }
+        │        │
+        │        └─→ 返回文件列表
+        │      
+        │      结果：arr 包含所有文件路径
+        │        arr = [
+        │          "./backdir/test.txt",
+        │          "./backdir/image.jpg",
+        │          "./backdir/document.pdf"
+        │        ]
+        │
+        ├─→ [步骤 2] 遍历所有文件
+        │      for (auto &a : arr) {
+        │        │
+        │        ├─→ [步骤 2.1] 热点判断
+        │        │      if (!HotJudge(a)) {
+        │        │          continue;  // 热点文件跳过
+        │        │      }
+        │        │      
+        │        │      HotJudge 流程 (hot.hpp: 61-72行)：
+        │        │        ├─→ 获取文件最后访问时间
+        │        │        │     FileUtil file(filename);
+        │        │        │     time_t last_atime = file.LastAcccessTime();
+        │        │        │     // last_atime = 1729087200 (文件最后被访问的时间戳)
+        │        │        │
+        │        │        ├─→ 获取当前系统时间
+        │        │        │     time_t cur_time = time(NULL);
+        │        │        │     // cur_time = 1729087250 (当前时间戳)
+        │        │        │
+        │        │        └─→ 计算时间差并判断
+        │        │              int diff = cur_time - last_atime;
+        │        │              // diff = 50 秒
+        │        │              
+        │        │              if (diff > _hot_time) {
+        │        │                  // 50 > 30（配置的热点时间阈值）
+        │        │                  return true;   // 非热点，需要压缩
+        │        │              }
+        │        │              return false;    // 热点，不压缩
+        │        │      
+        │        │      热点判断逻辑：
+        │        │        - 如果文件最近 30 秒内被访问过 → 热点文件 → 不压缩
+        │        │        - 如果文件超过 30 秒未被访问 → 非热点 → 压缩
+        │        │
+        │        ├─→ [步骤 2.2] 获取文件备份信息
+        │        │      BackupInfo bi;
+        │        │      if (!data->GetOneByRealPath(a, bi)) {
+        │        │          // 文件存在但没有备份信息
+        │        │          // （可能是手动放入 backdir 的文件）
+        │        │          bi.NewBackupInfo(a);
+        │        │      }
+        │        │      
+        │        │      GetOneByRealPath 流程 (data.hpp: 213-223行)：
+        │        │        ├─→ 加读锁
+        │        │        │     std::shared_lock<std::shared_mutex> lock(_rwlock);
+        │        │        │
+        │        │        ├─→ 遍历哈希表查找
+        │        │        │     for (const auto& pair : _table) {
+        │        │        │         if (pair.second._real_path == realpath) {
+        │        │        │             info = pair.second;
+        │        │        │             return true;
+        │        │        │         }
+        │        │        │     }
+        │        │        │
+        │        │        └─→ 释放锁
+        │        │      
+        │        │      结果：bi 包含文件的备份信息
+        │        │        bi._real_path = "./backdir/test.txt"
+        │        │        bi._pack_path = "./packdir/test.txt.lz"
+        │        │        bi._pack_flag = false
+        │        │
+        │        ├─→ [步骤 2.3] 压缩文件
+        │        │      FileUtil tmp(a);
+        │        │      // tmp 指向原始文件：./backdir/test.txt
+        │        │      
+        │        │      tmp.Compress(bi._pack_path);
+        │        │      // 压缩到：./packdir/test.txt.lz
+        │        │      
+        │        │      Compress 流程 (util.hpp)：
+        │        │        ├─→ 读取原始文件内容
+        │        │        │     std::ifstream ifs(realpath, std::ios::binary);
+        │        │        │     std::string body;
+        │        │        │     // 读取全部内容到 body
+        │        │        │
+        │        │        ├─→ 使用 zlib 压缩
+        │        │        │     std::string compressed = bundle::lz::compress(body);
+        │        │        │     // LZIP 压缩算法
+        │        │        │
+        │        │        └─→ 写入压缩包
+        │        │              std::ofstream ofs(packpath, std::ios::binary);
+        │        │              ofs.write(compressed.c_str(), compressed.size());
+        │        │              ofs.close();
+        │        │      
+        │        │      压缩效果示例：
+        │        │        原始文件：./backdir/test.txt (1024 字节)
+        │        │          ↓ 压缩
+        │        │        压缩包：./packdir/test.txt.lz (约 300 字节)
+        │        │        节省：约 70% 空间
+        │        │
+        │        ├─→ [步骤 2.4] 删除原始文件
+        │        │      tmp.Remove();
+        │        │      
+        │        │      Remove 流程 (util.hpp)：
+        │        │        std::filesystem::remove(path);
+        │        │      
+        │        │      文件系统变化：
+        │        │        删除：./backdir/test.txt  ❌
+        │        │        保留：./packdir/test.txt.lz  ✅
+        │        │
+        │        └─→ [步骤 2.5] 更新备份信息
+        │              bi._pack_flag = true;  // 标记为已压缩
+        │              data->Update(bi);
+        │              
+        │              Update 流程 (data.hpp: 161-198行)：
+        │                ├─→ 加写锁
+        │                │     std::unique_lock<std::shared_mutex> lock(_rwlock);
+        │                │
+        │                ├─→ 构造 UPDATE SQL 语句
+        │                │     UPDATE backup_info SET
+        │                │       pack_flag=1,
+        │                │       ...
+        │                │     WHERE url_path='/download/test.txt';
+        │                │
+        │                ├─→ 执行 SQL
+        │                │     stmt->executeUpdate(sql.str());
+        │                │
+        │                ├─→ 更新内存缓存
+        │                │     _table[info._url_path] = info;
+        │                │
+        │                └─→ 释放锁
+        │      }
+        │
+        └─→ [步骤 3] 休眠后继续下一轮
+              usleep(1000);  // 休眠 1000 微秒 = 1 毫秒
+              
+              然后继续 while 循环，进入下一轮扫描...
+      }
+```
+
+**压缩前后对比**：
+
+```
+压缩前：
+  文件系统：
+    ./backdir/test.txt (1024 字节)
+    ./packdir/ (空)
+  
+  数据库：
+    pack_flag = 0  (未压缩)
+
+压缩后：
+  文件系统：
+    ./backdir/ (test.txt 已删除)
+    ./packdir/test.txt.lz (约 300 字节)
+  
+  数据库：
+    pack_flag = 1  (已压缩)
+```
+
+**热点判断实例**：
+
+```
+场景 A：用户频繁访问文件
+  10:00:00  文件被访问（下载）→ atime 更新
+  10:00:15  热点线程扫描：当前时间 - atime = 15秒 < 30秒 → 热点 → 不压缩
+  10:00:30  热点线程扫描：当前时间 - atime = 30秒 = 30秒 → 不压缩
+  10:00:45  热点线程扫描：当前时间 - atime = 45秒 > 30秒 → 非热点 → 压缩
+
+场景 B：用户长时间不访问
+  10:00:00  文件上传完成
+  10:00:35  热点线程扫描：超过 30 秒未访问 → 立即压缩
+```
+
+**压缩与下载的交互**：
+
+```
+时间线：用户下载压缩文件
+
+T1: 热点线程压缩了文件
+    - ./backdir/test.txt 被删除
+    - ./packdir/test.txt.lz 创建
+    - pack_flag = 1
+
+T2: 用户请求下载 /download/test.txt
+    ↓
+    Download() 检测到 pack_flag = 1
+    ↓
+    自动解压：./packdir/test.txt.lz → ./backdir/test.txt
+    ↓
+    删除压缩包：./packdir/test.txt.lz
+    ↓
+    更新数据库：pack_flag = 0
+    ↓
+    返回文件内容给用户
+    
+T3: 文件恢复到未压缩状态
+    - ./backdir/test.txt 存在
+    - ./packdir/test.txt.lz 不存在
+    - pack_flag = 0
+```
+
+---
+
+## 多线程并发场景示例
+
+**场景**：热点线程正在压缩文件，同时用户请求下载该文件
+
+```
+时间轴：
+
+T1: 热点线程开始处理 test.txt
+    ├─→ HotJudge(test.txt) 返回 true（非热点）
+    ├─→ 开始压缩文件
+    └─→ 此时 pack_flag 仍为 false
+
+T2: 用户发送下载请求
+    ├─→ Download() 查询备份信息（需要加读锁）
+    ├─→ 此时热点线程可能正在写入（需要加写锁）
+    └─→ 读写锁机制保护：
+          - 如果热点线程持有写锁 → Download 等待
+          - 如果 Download 先获得读锁 → 热点线程等待
+
+T3: 热点线程完成压缩
+    ├─→ 删除原文件
+    ├─→ Update() 加写锁，设置 pack_flag = 1
+    └─→ 释放写锁
+
+T4: Download() 获得读锁
+    ├─→ 查询到 pack_flag = 1（已压缩）
+    ├─→ 自动解压文件
+    ├─→ Update() 设置 pack_flag = 0
+    └─→ 返回文件内容
+```
+
+**线程安全保护机制**：
+
+```cpp
+// data.hpp 中的读写锁
+
+class DataManager {
+private:
+    std::shared_mutex _rwlock;  // 读写锁
+    
+    // 读操作：多个线程可同时读
+    bool GetOneByURL(...) {
+        std::shared_lock<std::shared_mutex> lock(_rwlock);
+        // 查询内存哈希表...
+    }
+    
+    // 写操作：独占访问
+    bool Update(...) {
+        std::unique_lock<std::shared_mutex> lock(_rwlock);
+        // 修改数据库和内存...
+    }
+};
+```
+
+**锁机制特性**：
+- **读-读并发**：多个 Download 请求可同时执行
+- **读-写互斥**：Download 和 Update 不能同时执行
+- **写-写互斥**：多个 Update 操作串行执行
+- **自动解锁**：锁对象析构时自动释放锁
+
+---
+
 ## 技术难点与解决方案
 
 ### 1. 多线程数据竞争

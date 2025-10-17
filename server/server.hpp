@@ -212,8 +212,8 @@ namespace myspace
             }
             const auto &file = req.get_file_value("file");//获取上传文件对象
             // file.filename//文件名称    file.content//文件数据
-            std::string back_dir = Config::GetInstance().GetBackDir();
-            std::string realpath = back_dir + FileUtil(file.filename).FileName();
+            std::string back_dir = Config::GetInstance().GetBackDir();//"./backdir/"
+            std::string realpath = back_dir + FileUtil(file.filename).FileName();//"./backdir/test.txt"
             FileUtil fu(realpath);
             fu.SetContent(file.content); // 将数据写入文件中；
             BackupInfo info;
